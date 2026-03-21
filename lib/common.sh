@@ -20,7 +20,12 @@ error() { echo -e "${RED}[ERROR] $1${NC}"; }
 # Calculate absolute paths to avoid issues with where the script is run from
 LIB_DIR_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$LIB_DIR_ABS")"
-WORKSPACE_DIR="$REPO_ROOT/gki_build_workspace"
+# Try to put workspace outside REPO_ROOT for Bazel cleanliness, fallback if no permission
+if [ -w "$(dirname "$REPO_ROOT")" ]; then
+    WORKSPACE_DIR="$REPO_ROOT/../gki_build_workspace"
+else
+    WORKSPACE_DIR="$REPO_ROOT/gki_build_workspace"
+fi
 # Ensure WORKSPACE_DIR is absolute
 WORKSPACE_DIR="$(realpath -m "$WORKSPACE_DIR")"
 
