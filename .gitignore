@@ -118,7 +118,11 @@ series
 
 # Allow SUSFS patches
 !ksu_patches/
+!drivers/kernelsu/
+!drivers/kernelsu/
 !ksu_patches/*.patch
+!drivers/kernelsu/
+!drivers/kernelsu/
 
 # ctags files
 tags

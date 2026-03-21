@@ -1,0 +1,38 @@
+config KSU
+	tristate "KernelSU placeholder"
+	default n
+
+menu "KernelSU - SUSFS"
+config KSU_SUSFS
+	bool "KernelSU addon - SUSFS placeholder"
+	depends on KSU
+	default n
+
+config KSU_SUSFS_SUS_PATH
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_SUS_MOUNT
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_SUS_KSTAT
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_SPOOF_UNAME
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_ENABLE_LOG
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_OPEN_REDIRECT
+	bool "Placeholder"
+	depends on KSU_SUSFS
+config KSU_SUSFS_SUS_MAP
+	bool "Placeholder"
+	depends on KSU_SUSFS
+endmenu

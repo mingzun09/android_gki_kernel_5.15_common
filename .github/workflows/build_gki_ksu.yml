@@ -95,10 +95,10 @@ jobs:
     - name: Prepare Workspace Directory
       run: |
         # 创建 workspace 目录结构，以便缓存能正确恢复
-        mkdir -p gki_build_workspace/prebuilts/clang/host/linux-x86
-        mkdir -p gki_build_workspace/.repo
-        mkdir -p gki_build_workspace/build
-        mkdir -p gki_build_workspace/tools
+        mkdir -p ../gki_build_workspace/prebuilts/clang/host/linux-x86
+        mkdir -p ../gki_build_workspace/.repo
+        mkdir -p ../gki_build_workspace/build
+        mkdir -p ../gki_build_workspace/tools
 
     - name: Cache Repo Sync
       uses: actions/cache@v4

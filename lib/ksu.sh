@@ -18,9 +18,9 @@ setup_kernelsu() {
         log "Removing existing KernelSU directory..."
         rm -rf "KernelSU"
     fi
-    if [ -L "drivers/kernelsu" ]; then
-        log "Removing existing kernelsu symlink..."
-        rm -f "drivers/kernelsu"
+    if [ -e "drivers/kernelsu" ]; then
+        log "Removing existing kernelsu directory or symlink..."
+        rm -rf "drivers/kernelsu"
     fi
     
     # Run the official setup script WITHOUT arguments
@@ -124,10 +124,12 @@ setup_kernelsu() {
         
         cd ..
 
-        # Replace symlink with real directory for Bazel compatibility
-        log "Replacing drivers/kernelsu symlink with real directory..."
-        rm -f drivers/kernelsu
+        # Replace placeholder with real directory for Bazel compatibility
+        log "Replacing drivers/kernelsu placeholder with real directory..."
+        rm -rf drivers/kernelsu
         cp -a KernelSU/kernel drivers/kernelsu
+        rm -rf KernelSU
+        find drivers/kernelsu -name "BUILD" -o -name "WORKSPACE" -delete
         
         # Verify the directory and Kconfig exist
         if [ ! -d "drivers/kernelsu" ]; then

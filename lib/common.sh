@@ -17,35 +17,29 @@ warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
 error() { echo -e "${RED}[ERROR] $1${NC}"; }
 
 # Workspace configuration
-# Calculate absolute paths to avoid issues with where the script is run from
 LIB_DIR_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$LIB_DIR_ABS")"
-# Try to put workspace outside REPO_ROOT for Bazel cleanliness, fallback if no permission
-if [ -w "$(dirname "$REPO_ROOT")" ]; then
-    WORKSPACE_DIR="$REPO_ROOT/../gki_build_workspace"
+
+# Robust Workspace directory selection
+# If we are in GitHub Actions, use a directory in the runner's workspace but outside the repo
+if [ -n "$GITHUB_WORKSPACE" ]; then
+    WORKSPACE_DIR="$GITHUB_WORKSPACE/../gki_build_workspace"
 else
-    WORKSPACE_DIR="$REPO_ROOT/gki_build_workspace"
+    WORKSPACE_DIR="$REPO_ROOT/../gki_build_workspace"
 fi
-# Ensure WORKSPACE_DIR is absolute
 WORKSPACE_DIR="$(realpath -m "$WORKSPACE_DIR")"
 
-# 修正 KERNEL_SRC 指向源码根目录，避免 KernelSU setup 失败
 KERNEL_SRC="$REPO_ROOT"
 CLANG_DIR="$WORKSPACE_DIR/prebuilts/clang/host/linux-x86"
 CLANG_VER="clang-r547379"
 STAMP_BZL="$WORKSPACE_DIR/build/kernel/kleaf/impl/stamp.bzl"
 
-# Get script directory
 get_script_dir() {
     echo "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 }
 
-# Cleanup function (can be overridden by other modules)
 cleanup() {
-    # This will be extended by temp_monitor.sh
     true
 }
 
-# Setup cleanup trap
 trap cleanup EXIT
-
