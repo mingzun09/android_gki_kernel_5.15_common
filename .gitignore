@@ -116,6 +116,10 @@ patches-*
 patches
 series
 
+# Allow SUSFS patches
+!ksu_patches/
+!ksu_patches/*.patch
+
 # ctags files
 tags
 TAGS

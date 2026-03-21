@@ -47,7 +47,7 @@ setup_kernelsu() {
         # Apply SUSFS patch for KernelSU
         log "Applying SUSFS patch for KernelSU..."
         cd KernelSU
-        patch -p1 < "$MODULE_DIR/../patches/10_enable_susfs_for_ksu.patch" || {
+        patch -p1 < "$MODULE_DIR/../ksu_patches/10_enable_susfs_for_ksu.patch" || {
             error "Failed to apply SUSFS patch for KernelSU!"
             exit 1
         }
