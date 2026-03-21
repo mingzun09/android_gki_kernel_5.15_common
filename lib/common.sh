@@ -20,7 +20,7 @@ error() { echo -e "${RED}[ERROR] $1${NC}"; }
 # Calculate absolute paths to avoid issues with where the script is run from
 LIB_DIR_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$LIB_DIR_ABS")"
-WORKSPACE_DIR="$REPO_ROOT/../gki_build_workspace"
+WORKSPACE_DIR="$REPO_ROOT/gki_build_workspace"
 # Ensure WORKSPACE_DIR is absolute
 WORKSPACE_DIR="$(realpath -m "$WORKSPACE_DIR")"
 

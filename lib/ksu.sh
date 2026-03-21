@@ -43,6 +43,15 @@ setup_kernelsu() {
     # Verify installation
     if [ -d "KernelSU" ] && [ -d "KernelSU/kernel" ]; then
         log "KernelSU directory found."
+
+        # Apply SUSFS patch for KernelSU
+        log "Applying SUSFS patch for KernelSU..."
+        cd KernelSU
+        patch -p1 < "$MODULE_DIR/../patches/10_enable_susfs_for_ksu.patch" || {
+            error "Failed to apply SUSFS patch for KernelSU!"
+            exit 1
+        }
+        cd ..
         
         # Fix: Hardcode KernelSU version for Bazel build
         # Bazel runs in a sandbox and cannot access .git directory to determine version
@@ -78,11 +87,14 @@ setup_kernelsu() {
                 echo "ccflags-y += -DKSU_GIT_VERSION=\\\"$KSU_GIT_VERSION\\\"" >> kernel/Kbuild
             fi
 
+            # Fix: Add warning suppression to avoid build failures
+            echo "ccflags-y += -Wno-strict-prototypes -Wno-implicit-function-declaration" >> kernel/Kbuild
+
             # Debug: Show the grep result to verify
             log "Verifying KernelSU/kernel/Kbuild patch:"
             grep "DKSU_VERSION=$KSU_VERSION" kernel/Kbuild || warn "Patch might have failed!"
             
-            log "✓ Patched KernelSU/kernel/Kbuild with version"
+            log "✓ Patched KernelSU/kernel/Kbuild with version and warning suppressions"
         else
             warn "KernelSU/kernel/Kbuild not found. Version might be incorrect."
         fi
@@ -111,10 +123,15 @@ setup_kernelsu() {
         fi
         
         cd ..
+
+        # Replace symlink with real directory for Bazel compatibility
+        log "Replacing drivers/kernelsu symlink with real directory..."
+        rm -f drivers/kernelsu
+        cp -a KernelSU/kernel drivers/kernelsu
         
-        # Verify the symlink and Kconfig exist
-        if [ ! -L "drivers/kernelsu" ]; then
-            error "drivers/kernelsu symlink not created!"
+        # Verify the directory and Kconfig exist
+        if [ ! -d "drivers/kernelsu" ]; then
+            error "drivers/kernelsu directory not found!"
             exit 1
         fi
         if [ ! -f "drivers/kernelsu/Kconfig" ]; then
