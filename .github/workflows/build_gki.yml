@@ -5,10 +5,20 @@ on:
     branches:
       - serein
       - copilot/create-workflow-script-for-kernel
+    # 只改 CI 配置 / 文档的提交不值得起一次最长 6 小时的全量构建
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
+      - 'LICENSE'
   pull_request:
     branches:
       - copilot/create-workflow-script-for-kernel
   workflow_dispatch:
+
+# 同一分支连续 push 时取消旧的那次构建，避免多个 6 小时任务排队占资源
+concurrency:
+  group: gki-bazel-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

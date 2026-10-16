@@ -1,0 +1,246 @@
+# ==============================================================================
+#  定期清理 GitHub Actions 的缓存与过期产物
+# ==============================================================================
+#  为什么需要：
+#    * Actions 缓存配额是「每个仓库 10GB」。ccache 这种 GB 级缓存如果每次运行都新建
+#      条目（key 里带 commit sha 就会这样），几周就能把配额塞满 —— 结果是旧的被静默
+#      驱逐、新缓存永远命中不了，还白占 GitHub 的存储资源。
+#    * 产物（artifact）默认按 retention-days 过期，但过期文件仍会占存储直到被清掉。
+#
+#  本工作流做什么：
+#    1) 删除「超过 N 天没有被访问」的缓存（也可以一键清空全部缓存）
+#    2) 删除已过期 / 超过 N 天的产物
+#    3) 可选：删除 N 天前已结束的运行记录（连带其日志，最省存储）
+#    4) 前后各打印一次用量，并把汇总写进 job summary
+#
+#  安全设计：
+#    * 手动触发默认 dry_run=true，只报告不删除；要真删就手动选 false
+#    * 定时任务（每周日）以 keep_days=14 / artifacts_days=30 / runs_days=30 实际清理
+#    * 单次删除条数有上限（max_delete），避免一次全删造成意外
+#
+#  本地等价脚本：.github/scripts/cleanup_gh_cache.sh（用法见文件头）
+# ==============================================================================
+
+name: Cleanup Actions caches & artifacts
+
+on:
+  schedule:
+    # 每周日 03:17 UTC（避开整点，减少与其它任务撞车）
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只报告不删除（首次建议保留 true）'
+        required: true
+        default: true
+        type: boolean
+      keep_days:
+        description: '保留最近多少天内被访问过的缓存'
+        required: false
+        default: '14'
+      artifacts_days:
+        description: '删除多少天前的产物（0=不清理产物）'
+        required: false
+        default: '30'
+      runs_days:
+        description: '删除多少天前已结束的运行记录（0=不动运行历史）'
+        required: false
+        default: '0'
+      purge_all_caches:
+        description: '无视 keep_days，清空全部缓存（慎用）'
+        required: true
+        default: false
+        type: boolean
+      max_delete:
+        description: '单次最多删除多少条（防止误删）'
+        required: false
+        default: '300'
+      protected_keys:
+        description: '永不自动删除的缓存 key（逗号分隔；默认保护 build_gki.yml 的 AOSP 缓存）'
+        required: false
+        default: 'Linux-repo-sync-v1'
+      keep_newest_ccache:
+        description: 'ccache 缓存只保留最新 N 条，其余按天龄清理（0=不启用该策略）'
+        required: false
+        default: '3'
+
+permissions:
+  actions: write   # 删除缓存/产物/运行记录需要
+  contents: read
+
+concurrency:
+  group: cleanup-actions-storage
+  cancel-in-progress: false
+
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+  KEEP_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_days || '14' }}
+  ARTIFACTS_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.artifacts_days || '30' }}
+  RUNS_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs_days || '30' }}
+  PURGE_ALL_CACHES: ${{ github.event_name == 'workflow_dispatch' && inputs.purge_all_caches || false }}
+  MAX_DELETE: ${{ github.event_name == 'workflow_dispatch' && inputs.max_delete || '300' }}
+  PROTECTED_KEYS: ${{ github.event_name == 'workflow_dispatch' && inputs.protected_keys || 'Linux-repo-sync-v1' }}
+  KEEP_NEWEST_CCACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_newest_ccache || '3' }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 清理前用量
+        run: |
+          set -euo pipefail
+          echo "== 缓存用量 =="
+          usage_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage")"
+          used="$(printf '%s' "$usage_json" | grep -o '"active_caches_size_in_bytes":[0-9]*' | cut -d: -f2 || true)"
+          cnt="$(printf '%s' "$usage_json" | grep -o '"active_caches_count":[0-9]*' | cut -d: -f2 || true)"
+          echo "缓存条数 ${cnt:-0}，占用 $(( ${used:-0} / 1048576 )) MB（仓库上限 10GB）"
+
+      - name: 清理缓存
+        # 策略（对着本仓库真实情况设计）：
+        #   * `Linux-repo-sync-v1` 是 build_gki.yml 存的 AOSP 源码/prebuilts 缓存，本体 ~8G、
+        #     重建一次要重新 repo sync 很久 —— 默认放进 PROTECTED_KEYS，定时清理不碰它。
+        #   * ccache 缓存会随源码变化不断新生，按「保留最新 N 条」轮转，避免把 10GB 配额塞满
+        #     导致有用的缓存被 GitHub 自动淘汰。
+        #   * 其余缓存按「超过 keep_days 天没被访问」删除。
+        run: |
+          set -euo pipefail
+          echo "模式: dry_run=$DRY_RUN | keep_days=$KEEP_DAYS | purge_all=$PURGE_ALL_CACHES | max_delete=$MAX_DELETE"
+          echo "受保护 key: ${PROTECTED_KEYS:-<无>} | ccache 保留最新 ${KEEP_NEWEST_CCACHE:-0} 条"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | [.id, .size_in_bytes, .last_accessed_at, .created_at, .key] | @tsv' > /tmp/caches.tsv || true
+
+          # 按创建时间从新到旧，挑出要保留的 ccache 条目 id
+          KEEP_IDS=" "
+          if [ "${KEEP_NEWEST_CCACHE:-0}" -gt 0 ] && [ -s /tmp/caches.tsv ]; then
+            KEEP_IDS="$(awk -F'\t' 'tolower($5) ~ /ccache/' /tmp/caches.tsv | sort -t$'\t' -k4,4r | head -n "$KEEP_NEWEST_CCACHE" | cut -f1 | tr '\n' ' ')"
+            echo "[+] 按策略保留的 ccache: $(printf '%s' "$KEEP_IDS" | tr ' ' '\n' | grep -v '^$' | while read -r kid; do awk -F'\t' -v i="$kid" '$1==i{print $5}' /tmp/caches.tsv; done | tr '\n' ' ')"
+          fi
+
+          DELETED=0; DELETED_BYTES=0; KEPT=0
+          if [ -s /tmp/caches.tsv ]; then
+            while IFS=$'\t' read -r id size accessed created key; do
+              [ -n "${id:-}" ] || continue
+              do_delete=0
+              if [ "$PURGE_ALL_CACHES" = "true" ]; then
+                do_delete=1
+              elif [ -n "${KEEP_IDS# }" ] && [ "${KEEP_IDS#* $id }" != "$KEEP_IDS" ]; then
+                echo "保留（最新 ccache 配额内）| $key"
+                KEPT=$((KEPT+1)); continue
+              elif [ -n "${PROTECTED_KEYS:-}" ] && printf '%s' "$PROTECTED_KEYS" | tr ',' '\n' | grep -qxF "$key"; then
+                echo "保留（受保护 key，$(( size / 1048576 )) MB）| $key"
+                KEPT=$((KEPT+1)); continue
+              else
+                acc=$(date -u -d "$accessed" +%s 2>/dev/null || echo 0)
+                [ "$acc" = "0" ] && acc=$(date -u +%s)
+                age_days=$(( ( $(date -u +%s) - acc ) / 86400 ))
+                [ "$age_days" -ge "$KEEP_DAYS" ] && do_delete=1
+              fi
+              if [ "$do_delete" -eq 1 ]; then
+                if [ "$DELETED" -ge "$MAX_DELETE" ]; then
+                  echo "::warning::达到单次上限 $MAX_DELETE，剩余缓存下次再清"
+                  break
+                fi
+                echo "删除缓存 [$(( size / 1048576 )) MB] 创建 ${created%%T*} 最后访问 ${accessed%%T*} | $key"
+                if [ "$DRY_RUN" != "true" ]; then
+                  gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" || echo "::warning::删除 $id 失败"
+                fi
+                DELETED=$((DELETED+1)); DELETED_BYTES=$((DELETED_BYTES+size))
+              else
+                KEPT=$((KEPT+1))
+              fi
+            done < /tmp/caches.tsv
+          else
+            echo "没有缓存"
+          fi
+          echo "缓存: 删除 $DELETED 条（$(( DELETED_BYTES / 1048576 )) MB），保留 $KEPT 条"
+          {
+            echo "### 缓存清理"
+            echo "- 删除：$DELETED 条（$(( DELETED_BYTES / 1048576 )) MB）"
+            echo "- 保留：$KEPT 条（受保护 key：${PROTECTED_KEYS:-无}；ccache 保留最新 ${KEEP_NEWEST_CCACHE:-0} 条）"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: 清理过期产物
+        if: env.ARTIFACTS_DAYS != '0'
+        run: |
+          set -euo pipefail
+          echo "模式: dry_run=$DRY_RUN | 删除 $ARTIFACTS_DAYS 天前或已过期的产物"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .size_in_bytes, .created_at, .expired, .name] | @tsv' > /tmp/arts.tsv || true
+
+          DELETED=0; DELETED_BYTES=0
+          if [ -s /tmp/arts.tsv ]; then
+            while IFS=$'\t' read -r id size created expired name; do
+              [ -n "${id:-}" ] || continue
+              created_epoch=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
+              age_days=$(( ( $(date -u +%s) - created_epoch ) / 86400 ))
+              if [ "$expired" = "true" ] || [ "$age_days" -ge "$ARTIFACTS_DAYS" ]; then
+                if [ "$DELETED" -ge "$MAX_DELETE" ]; then
+                  echo "::warning::达到单次上限 $MAX_DELETE，剩余产物下次再清"
+                  break
+                fi
+                echo "删除产物 [$(( size / 1048576 )) MB] ${created%%T*} | $name"
+                if [ "$DRY_RUN" != "true" ]; then
+                  gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" || echo "::warning::删除 $id 失败"
+                fi
+                DELETED=$((DELETED+1)); DELETED_BYTES=$((DELETED_BYTES+size))
+              fi
+            done < /tmp/arts.tsv
+          else
+            echo "没有产物"
+          fi
+          echo "产物: 删除 $DELETED 个（$(( DELETED_BYTES / 1048576 )) MB）"
+          {
+            echo "### 产物清理"
+            echo "- 删除：$DELETED 个（$(( DELETED_BYTES / 1048576 )) MB）"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: 清理旧运行记录
+        if: env.RUNS_DAYS != '0'
+        run: |
+          set -euo pipefail
+          echo "模式: dry_run=$DRY_RUN | 删除 $RUNS_DAYS 天前已结束的运行记录（含其日志）"
+          CUTOFF=$(date -u -d "$RUNS_DAYS days ago" +%s)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100&status=completed" \
+            --jq '.workflow_runs[] | [.id, .created_at, .conclusion, .name, (.head_sha[0:8])] | @tsv' > /tmp/runs.tsv || true
+
+          DELETED=0
+          if [ -s /tmp/runs.tsv ]; then
+            while IFS=$'\t' read -r id created conclusion name sha; do
+              [ -n "${id:-}" ] || continue
+              created_epoch=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
+              [ "$created_epoch" -ge "$CUTOFF" ] && continue
+              if [ "$DELETED" -ge "$MAX_DELETE" ]; then
+                echo "::warning::达到单次上限 $MAX_DELETE，剩余运行记录下次再清"
+                break
+              fi
+              echo "删除运行 $id | ${created%%T*} | $conclusion | $name | $sha"
+              if [ "$DRY_RUN" != "true" ]; then
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" || echo "::warning::删除 $id 失败"
+              fi
+              DELETED=$((DELETED+1))
+            done < /tmp/runs.tsv
+          else
+            echo "没有可清理的运行记录"
+          fi
+          echo "运行记录: 删除 $DELETED 条"
+          {
+            echo "### 运行记录清理"
+            echo "- 删除：$DELETED 条"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: 清理后用量
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "== 清理后缓存用量 =="
+          usage_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage")"
+          used="$(printf '%s' "$usage_json" | grep -o '"active_caches_size_in_bytes":[0-9]*' | cut -d: -f2 || true)"
+          cnt="$(printf '%s' "$usage_json" | grep -o '"active_caches_count":[0-9]*' | cut -d: -f2 || true)"
+          echo "缓存条数 ${cnt:-0}，占用 $(( ${used:-0} / 1048576 )) MB"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::本次为 dry-run，未删除任何内容"
+          fi
