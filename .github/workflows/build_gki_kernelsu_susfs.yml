@@ -45,6 +45,14 @@ on:
         options:
           - 'false'
           - 'true'
+      kernel_version_suffix:
+        description: '固定版本串（写入 CONFIG_LOCALVERSION，如 -mykernel-1.0；留空=保持仓库默认，会带 -g<sha>-dirty）'
+        required: false
+        default: ''
+      build_time:
+        description: '固定编译时间戳 KBUILD_BUILD_TIMESTAMP（如 "Sun Dec 01 08:10:00 UTC 2024"；留空=当前时间）'
+        required: false
+        default: ''
       ccache_max_size:
         description: 'ccache 容量上限（如 2G / 4G）'
         required: false
@@ -65,6 +73,8 @@ env:
   KSU_REF: ${{ inputs.ksu_ref }}
   SUSFS_REF: ${{ inputs.susfs_ref }}
   BUILD_MODULES: ${{ inputs.build_modules }}
+  KERNEL_VERSION_SUFFIX: ${{ inputs.kernel_version_suffix }}
+  BUILD_TIME: ${{ inputs.build_time }}
   # 验证过的补丁指纹（LF 换行）；默认 ref 下若对不上直接报错，防止上游悄悄改动
   PATCH_MD5_50: d8559ba63c8e2c0ff9e41f494d0bbbfe
   PATCH_MD5_10: cc6d714d7a7f5d4b71267e0c99b0193d
@@ -165,11 +175,18 @@ jobs:
           ccache --version | head -n1
           ccache -M "$CCACHE_MAXSIZE"
 
+      - name: Compute cache key day
+        id: cachekey
+        run: |
+          # key 里用「日期」而不是 commit sha：每天最多新增一个缓存条目，
+          # 避免每次运行都新建条目把 10GB 配额塞满。
+          echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ${{ runner.os }}-ccache-gki515-ksususfs-${{ inputs.ksu_ref }}-${{ hashFiles('kernel/arch/arm64/configs/gki_defconfig') }}-${{ github.sha }}
+          key: ${{ runner.os }}-ccache-gki515-ksususfs-${{ inputs.ksu_ref }}-${{ hashFiles('kernel/arch/arm64/configs/gki_defconfig') }}-${{ steps.cachekey.outputs.day }}
           restore-keys: |
             ${{ runner.os }}-ccache-gki515-ksususfs-${{ inputs.ksu_ref }}-
             ${{ runner.os }}-ccache-gki515-ksususfs-
@@ -199,8 +216,25 @@ jobs:
         run: |
           set -euo pipefail
           echo "[+] 取 setup.sh (ref=$KSU_REF)"
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/${KSU_REF}/kernel/setup.sh" -o "$RUNNER_TEMP/ksu-setup.sh"
-          bash "$RUNNER_TEMP/ksu-setup.sh" "$KSU_REF"
+          curl -fLSs --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://raw.githubusercontent.com/tiann/KernelSU/${KSU_REF}/kernel/setup.sh" \
+            -o "$RUNNER_TEMP/ksu-setup.sh"
+
+          # setup.sh 内部会 git clone 上游仓库，网络抖动会留下半成品目录 → 清干净重试
+          integrate_ksu() {
+            local attempt
+            for attempt in 1 2 3; do
+              echo "[+] 执行 setup.sh $KSU_REF（第 $attempt/3 次）"
+              rm -rf KernelSU drivers/kernelsu
+              if bash "$RUNNER_TEMP/ksu-setup.sh" "$KSU_REF"; then
+                return 0
+              fi
+              echo "::warning::KernelSU 集成第 $attempt 次失败，5 秒后重试"
+              sleep 5
+            done
+            return 1
+          }
+          integrate_ksu || { echo "::error::KernelSU 集成连续 3 次失败"; exit 1; }
 
           echo "[+] 校验集成结果"
           test -L drivers/kernelsu || { echo "::error::drivers/kernelsu 符号链接缺失"; exit 1; }
@@ -233,9 +267,13 @@ jobs:
           echo "SUSFS 使用提交: $SUSFS_COMMIT"
           git -C susfs4ksu log -1 --format='date: %ad%nsubject: %s' --date=iso
 
-          P50="susfs4ksu/kernel_patches/50_add_susfs_in_${ANDROID_VER}-${KERNEL_VER}.patch"
+          # 上游真实文件名带 gki- 前缀（实测：50_add_susfs_in_gki-android13-5.15.patch）。
+          # 为兼容上游改名，带前缀找不到就退回不带前缀的写法。
+          P50="susfs4ksu/kernel_patches/50_add_susfs_in_gki-${ANDROID_VER}-${KERNEL_VER}.patch"
+          [ -f "$P50" ] || P50="susfs4ksu/kernel_patches/50_add_susfs_in_${ANDROID_VER}-${KERNEL_VER}.patch"
           P10="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          test -f "$P50" || { echo "::error::找不到 $P50"; exit 1; }
+          echo "50_ 补丁路径: $P50"
+          test -f "$P50" || { echo "::error::找不到 50_ 补丁"; ls -l susfs4ksu/kernel_patches/; exit 1; }
           test -f "$P10" || { echo "::error::找不到 $P10"; exit 1; }
 
           MD5_50="$(md5sum "$P50" | cut -d' ' -f1)"
@@ -266,8 +304,11 @@ jobs:
         run: |
           set -euo pipefail
           SUSFS=susfs4ksu
-          P50="$SUSFS/kernel_patches/50_add_susfs_in_${ANDROID_VER}-${KERNEL_VER}.patch"
+          # 与上一步同样的解析（带 gki- 前缀优先），保证两处路径一致
+          P50="$SUSFS/kernel_patches/50_add_susfs_in_gki-${ANDROID_VER}-${KERNEL_VER}.patch"
+          [ -f "$P50" ] || P50="$SUSFS/kernel_patches/50_add_susfs_in_${ANDROID_VER}-${KERNEL_VER}.patch"
           P10="$SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          test -f "$P50" || { echo "::error::找不到 50_ 补丁: $P50"; exit 1; }
 
           echo "[1/5] 复制源文件"
           cp "$SUSFS/kernel_patches/fs/"* fs/
@@ -321,6 +362,20 @@ jobs:
           grep -q '^CONFIG_KSU_SUSFS=y' "$DEF" || echo 'CONFIG_KSU_SUSFS=y' >> "$DEF"
           grep -q '^CONFIG_WERROR=n' "$DEF" || echo 'CONFIG_WERROR=n' >> "$DEF"
 
+          # 可选：固定版本串（默认不改，保持仓库原样）
+          if [ -n "${KERNEL_VERSION_SUFFIX:-}" ]; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$KERNEL_VERSION_SUFFIX\"|" "$DEF"
+            sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$DEF"
+            sed -i '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' "$DEF"
+            echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEF"
+            echo "[+] 版本串固定为: $KERNEL_VERSION_SUFFIX（并关闭 LOCALVERSION_AUTO）"
+          fi
+
+          # scripts/setlocalversion 判断的是「环境变量 LOCALVERSION 是否被设置」：没设置就追加 "+"。
+          # 显式导出空值抑制它，并写进 GITHUB_ENV 让后面的编译步骤继承。
+          export LOCALVERSION=""
+          echo "LOCALVERSION=" >> "$GITHUB_ENV"
+
           export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
@@ -337,9 +392,15 @@ jobs:
           set -euo pipefail
           export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
           echo "编译内核（$(clang --version | head -n1)）"
+          TIME_ARGS=()
+          if [ -n "${BUILD_TIME:-}" ]; then
+            export KBUILD_BUILD_TIMESTAMP="$BUILD_TIME"
+            TIME_ARGS+=("KBUILD_BUILD_TIMESTAMP=$BUILD_TIME")
+            echo "[+] 固定编译时间戳: $BUILD_TIME"
+          fi
           ccache -z
           START=$(date -u +%s)
-          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image Image.gz 2>&1 | tee out/build.log
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 ${TIME_ARGS[@]+"${TIME_ARGS[@]}"} Image Image.gz 2>&1 | tee out/build.log
           if [ "$BUILD_MODULES" = "true" ]; then
             make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 modules 2>&1 | tee -a out/build.log
           fi
@@ -415,21 +476,28 @@ jobs:
           } | tee out/build-info.txt
           cp out/.config out/kernel-config.txt
 
-      - name: Upload Kernel Artifacts
+          # 产物只保留 anykernel.zip：把构建信息/内核配置/SUSFS 补丁信息一并塞进包里
+          if [ -f out/anykernel.zip ]; then
+            zip -j -q out/anykernel.zip out/build-info.txt out/kernel-config.txt || true
+            if [ -f out/susfs-patch-info.txt ]; then
+              zip -j -q out/anykernel.zip out/susfs-patch-info.txt || true
+            fi
+            echo "[+] AK3 包内容："
+            unzip -l out/anykernel.zip | tail -28
+          fi
+
+      # 产物只保留 AnyKernel3 打包结果（Image / 构建信息 / 内核配置 / SUSFS 补丁信息都已打进 anykernel.zip）
+      - name: Upload AnyKernel3 Package
         uses: actions/upload-artifact@v4
         with:
-          name: GKI-5.15-KernelSU-SUSFS-${{ inputs.ksu_ref }}
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/anykernel.zip
-            kernel/out/build-info.txt
-            kernel/out/kernel-config.txt
-            kernel/out/susfs-patch-info.txt
+          name: GKI-5.15-KernelSU-SUSFS-${{ inputs.ksu_ref }}-anykernel3
+          path: kernel/out/anykernel.zip
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Build Logs
-        if: always()
+      # 编译日志只在失败时上传，成功时不占产物配额
+      - name: Upload Build Logs (failure only)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_id }}
