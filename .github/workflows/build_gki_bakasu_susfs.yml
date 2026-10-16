@@ -476,21 +476,28 @@ jobs:
           } | tee out/build-info.txt
           cp out/.config out/kernel-config.txt
 
-      - name: Upload Kernel Artifacts
+          # 产物只保留 anykernel.zip：把构建信息/内核配置/SUSFS 补丁信息一并塞进包里
+          if [ -f out/anykernel.zip ]; then
+            zip -j -q out/anykernel.zip out/build-info.txt out/kernel-config.txt || true
+            if [ -f out/susfs-patch-info.txt ]; then
+              zip -j -q out/anykernel.zip out/susfs-patch-info.txt || true
+            fi
+            echo "[+] AK3 包内容："
+            unzip -l out/anykernel.zip | tail -28
+          fi
+
+      # 产物只保留 AnyKernel3 打包结果（Image / 构建信息 / 内核配置 / SUSFS 补丁信息都已打进 anykernel.zip）
+      - name: Upload AnyKernel3 Package
         uses: actions/upload-artifact@v4
         with:
-          name: GKI-5.15-BakaSU-SUSFS-${{ inputs.bakasu_ref }}
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/anykernel.zip
-            kernel/out/build-info.txt
-            kernel/out/kernel-config.txt
-            kernel/out/susfs-patch-info.txt
+          name: GKI-5.15-BakaSU-SUSFS-${{ inputs.bakasu_ref }}-anykernel3
+          path: kernel/out/anykernel.zip
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Build Logs
-        if: always()
+      # 编译日志只在失败时上传，成功时不占产物配额
+      - name: Upload Build Logs (failure only)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_id }}

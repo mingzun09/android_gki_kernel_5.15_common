@@ -10,11 +10,18 @@
 #      现场编译，vermagic / modversions 天然一致，装机后由 ksud 自动加载
 #    * ccache + actions/cache：重复构建可复用编译缓存
 #
-#  为什么不用 simonpunk/susfs4ksu 的内核内补丁？
-#    见文件末尾「SUSFS 路线说明」。简言之：那条路线需要 KernelSU 侧配套补丁
-#    (10_enable_susfs_for_ksu.patch) 提供 ksu_handle_stat / ksu_vfsmnt / … 等一整套
-#    符号，而该补丁在 KernelSU-Next（dev / v3.4.0~v3.4.2）上都存在失败 hunk 且会与
-#    KSU-Next 自带的 susfs 代码重复定义，无法直接套用。
+#  为什么不用 simonpunk/susfs4ksu 的内核内补丁？（2026-10-16 实测）
+#    那条路线需要 KernelSU 侧配套补丁 (10_enable_susfs_for_ksu.patch) 提供
+#    ksu_handle_stat / ksu_vfsmnt / ksu_sid / ksu_domain / ksu_is_input_hook_enabled …
+#    一整套符号。实测：
+#      * 该 KSU 侧补丁在 KernelSU-Next 全版本（v3.2.0/v3.3.0/v3.4.0/v3.4.1/v3.4.2/dev）
+#        都有失败 hunk（dev 21 行、v3.4.2 21 行、v3.4.1 28 行…），且 KSU-Next 已定义
+#        同名 susfs 胶水 → 重复定义；
+#      * KernelSU-Next 任何版本都没有 config KSU_SUSFS（内核侧 50_ 补丁的所有代码都在
+#        #ifdef CONFIG_KSU_SUSFS 下 → 会变成死代码），且 50_ 补丁需要的 11 个符号在
+#        KSU-Next 里命中 0/11 → 强行打开该选项就是链接失败。
+#    结论：内核内 SUSFS 必须配原版 KernelSU（见 build_gki_kernelsu_susfs.yml）；
+#          KSU-Next 就用它自带的 LKM 形态 SUSFS（本工作流）。
 # ==============================================================================
 
 name: Build GKI 5.15 KernelSU-Next + SUSFS
@@ -42,6 +49,14 @@ on:
         options:
           - 'false'
           - 'true'
+      kernel_version_suffix:
+        description: '固定版本串（写入 CONFIG_LOCALVERSION，如 -mykernel-1.0；留空=保持仓库默认，会带 -g<sha>-dirty）'
+        required: false
+        default: ''
+      build_time:
+        description: '固定编译时间戳 KBUILD_BUILD_TIMESTAMP（如 "Sun Dec 01 08:10:00 UTC 2024"；留空=当前时间）'
+        required: false
+        default: ''
       ccache_max_size:
         description: 'ccache 容量上限（如 2G / 4G）'
         required: false
@@ -59,6 +74,8 @@ env:
   KSU_REF: ${{ inputs.ksu_ref }}
   SUSFS_MODE: ${{ inputs.susfs_mode }}
   BUILD_MODULES: ${{ inputs.build_modules }}
+  KERNEL_VERSION_SUFFIX: ${{ inputs.kernel_version_suffix }}
+  BUILD_TIME: ${{ inputs.build_time }}
   # ---- ccache ----
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: ${{ inputs.ccache_max_size }}
@@ -165,13 +182,18 @@ jobs:
           ccache -M "$CCACHE_MAXSIZE"
           ccache -s
 
+      - name: Compute cache key day
+        id: cachekey
+        run: |
+          # key 里用「日期」而不是 commit sha：同一份源码在同一天重跑能命中同一份缓存，
+          # 而每天最多新增一个缓存条目 —— 否则每次运行都新建条目，几周就把 10GB 配额塞满。
+          echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          # 主 key 带上 commit：同 commit 重跑能精确命中
-          key: ${{ runner.os }}-ccache-gki515-ksunext-${{ inputs.ksu_ref }}-${{ hashFiles('kernel/arch/arm64/configs/gki_defconfig') }}-${{ github.sha }}
-          # 兜底：总是尽量恢复最近一次的缓存（ccache 自身会忽略不匹配的对象）
+          key: ${{ runner.os }}-ccache-gki515-ksunext-${{ inputs.ksu_ref }}-${{ hashFiles('kernel/arch/arm64/configs/gki_defconfig') }}-${{ steps.cachekey.outputs.day }}
           restore-keys: |
             ${{ runner.os }}-ccache-gki515-ksunext-${{ inputs.ksu_ref }}-
             ${{ runner.os }}-ccache-gki515-ksunext-
@@ -186,11 +208,28 @@ jobs:
           set -euo pipefail
           SETUP_REF="${KSU_REF:-dev}"
           echo "[+] 取 KernelSU-Next 的 setup.sh (ref=$SETUP_REF)"
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${SETUP_REF}/kernel/setup.sh" -o "$RUNNER_TEMP/ksu-setup.sh"
+          # --retry：raw.githubusercontent 偶发 5xx/连接中断时自动重试
+          curl -fLSs --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${SETUP_REF}/kernel/setup.sh" \
+            -o "$RUNNER_TEMP/ksu-setup.sh"
           head -n 5 "$RUNNER_TEMP/ksu-setup.sh"
 
-          echo "[+] 执行 setup.sh ${KSU_REF:-<最新 tag>}"
-          bash "$RUNNER_TEMP/ksu-setup.sh" ${KSU_REF:-}
+          # setup.sh 内部会 git clone 上游仓库，网络抖动可能导致半成品目录；
+          # 这里失败就清干净重试，最多 3 次（上游项目也专门为此加过重试）
+          integrate_ksu() {
+            local attempt
+            for attempt in 1 2 3; do
+              echo "[+] 执行 setup.sh ${KSU_REF:-<最新 tag>}（第 $attempt/3 次）"
+              rm -rf KernelSU-Next drivers/kernelsu
+              if bash "$RUNNER_TEMP/ksu-setup.sh" ${KSU_REF:-}; then
+                return 0
+              fi
+              echo "::warning::KernelSU-Next 集成第 $attempt 次失败，5 秒后重试"
+              sleep 5
+            done
+            return 1
+          }
+          integrate_ksu || { echo "::error::KernelSU-Next 集成连续 3 次失败"; exit 1; }
 
           echo "[+] 校验集成结果"
           test -L drivers/kernelsu || { echo "::error::drivers/kernelsu 符号链接缺失"; exit 1; }
@@ -245,6 +284,21 @@ jobs:
           grep -q '^CONFIG_KSU=y' "$DEFCONFIG" || echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
           grep -q '^CONFIG_WERROR=n' "$DEFCONFIG" || echo 'CONFIG_WERROR=n' >> "$DEFCONFIG"
 
+          # 可选：固定版本串。默认不改，保持仓库原样（会带 -g<sha>-dirty 后缀）
+          if [ -n "${KERNEL_VERSION_SUFFIX:-}" ]; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$KERNEL_VERSION_SUFFIX\"|" "$DEFCONFIG"
+            sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$DEFCONFIG"
+            sed -i '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' "$DEFCONFIG"
+            echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEFCONFIG"
+            echo "[+] 版本串固定为: $KERNEL_VERSION_SUFFIX（并关闭 LOCALVERSION_AUTO，去掉 git 后缀与 -dirty）"
+          fi
+
+          # scripts/setlocalversion 判断的是「环境变量 LOCALVERSION 是否被设置」：没设置就追加一个
+          # "+"（表示当前不在干净的 tag 上）。这里显式导出空值抑制它，版本串仅由 CONFIG_LOCALVERSION 决定。
+          # 写进 GITHUB_ENV，后面 Build Kernel / LKM 步骤都会继承。
+          export LOCALVERSION=""
+          echo "LOCALVERSION=" >> "$GITHUB_ENV"
+
           export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
@@ -260,9 +314,18 @@ jobs:
           set -euo pipefail
           export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
           echo "编译内核（$(clang --version | head -n1)）"
+
+          # 可选：固定编译时间戳（可复现构建）
+          TIME_ARGS=()
+          if [ -n "${BUILD_TIME:-}" ]; then
+            export KBUILD_BUILD_TIMESTAMP="$BUILD_TIME"
+            TIME_ARGS+=("KBUILD_BUILD_TIMESTAMP=$BUILD_TIME")
+            echo "[+] 固定编译时间戳: $BUILD_TIME"
+          fi
+
           ccache -z
           START=$(date -u +%s)
-          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image Image.gz 2>&1 | tee out/build.log
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 ${TIME_ARGS[@]+"${TIME_ARGS[@]}"} Image Image.gz 2>&1 | tee out/build.log
           # 注意：只编 Image 不会生成 Module.symvers / scripts/module.lds，
           # 而外部模块（SUSFS LKM）必须有它们才能编。所以要 lkm 或要模块时都得走一遍 make modules。
           if [ "$SUSFS_MODE" = "lkm" ] || [ "$BUILD_MODULES" = "true" ]; then
@@ -375,6 +438,14 @@ jobs:
 
           if [ "$SUSFS_MODE" = "lkm" ]; then
             LABEL="GKI 5.15 + KernelSU-Next ${KSU_DESCRIBE:-} + SUSFS(LKM)"
+            # LKM 一起放进 AK3 包 —— 因为产物只保留 anykernel.zip，不能把 ko 弄丢。
+            # 刷完后仍需手动加载：解压出 susfs_guard_lkm.ko 再 su -c "ksud insmod <路径>"
+            if [ -f out/susfs_guard_lkm.ko ]; then
+              cp out/susfs_guard_lkm.ko "$AK3_DIR/susfs_guard_lkm.ko"
+              echo "[+] 已把 susfs_guard_lkm.ko（$(stat -c%s out/susfs_guard_lkm.ko) 字节）打进 AK3 包"
+            else
+              echo "::warning::SUSFS_MODE=lkm 但没找到 out/susfs_guard_lkm.ko"
+            fi
           else
             LABEL="GKI 5.15 + KernelSU-Next ${KSU_DESCRIBE:-}"
           fi
@@ -406,21 +477,25 @@ jobs:
           } | tee out/build-info.txt
           cp out/.config out/kernel-config.txt
 
-      - name: Upload Kernel Artifacts
+          # 产物只保留 anykernel.zip：把构建信息与内核配置一并塞进包里
+          if [ -f out/anykernel.zip ]; then
+            zip -j -q out/anykernel.zip out/build-info.txt out/kernel-config.txt || true
+            echo "[+] AK3 包内容："
+            unzip -l out/anykernel.zip | tail -28
+          fi
+
+      # 产物只保留 AnyKernel3 打包结果（Image / LKM / 构建信息 / 内核配置都已打进 anykernel.zip）
+      - name: Upload AnyKernel3 Package
         uses: actions/upload-artifact@v4
         with:
-          name: GKI-5.15-KSUNext-${{ env.KSU_DESCRIBE || inputs.ksu_ref }}
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/susfs_guard_lkm.ko
-            kernel/out/anykernel.zip
-            kernel/out/build-info.txt
-            kernel/out/kernel-config.txt
+          name: GKI-5.15-KSUNext-${{ env.KSU_DESCRIBE || inputs.ksu_ref }}-anykernel3
+          path: kernel/out/anykernel.zip
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Build Logs
-        if: always()
+      # 编译日志只在失败时上传，成功时不占产物配额
+      - name: Upload Build Logs (failure only)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_id }}
