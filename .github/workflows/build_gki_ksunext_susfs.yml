@@ -1,0 +1,464 @@
+# ==============================================================================
+#  Build GKI 5.15 (android13-5.15) + KernelSU-Next + SUSFS
+# ==============================================================================
+#  与 build_gki.yml / build_gki_ksu.yml 的区别：
+#    * 不再走 repo sync + Bazel/Kleaf，而是 AOSP Clang 14.0.6 (r450784e) + 纯 make
+#      直接编译本仓库源码，产物为 Image / Image.gz / anykernel.zip
+#    * KernelSU 侧用 KernelSU-Next 官方 setup.sh 集成（把上游 kernel/ 源码复制进
+#      drivers/kernelsu 并注入 drivers/Makefile、drivers/Kconfig）
+#    * SUSFS 侧用 KernelSU-Next 自带的 susfs_guard_lkm.ko：对着本次编译出的内核
+#      现场编译，vermagic / modversions 天然一致，装机后由 ksud 自动加载
+#    * ccache + actions/cache：重复构建可复用编译缓存
+#
+#  为什么不用 simonpunk/susfs4ksu 的内核内补丁？
+#    见文件末尾「SUSFS 路线说明」。简言之：那条路线需要 KernelSU 侧配套补丁
+#    (10_enable_susfs_for_ksu.patch) 提供 ksu_handle_stat / ksu_vfsmnt / … 等一整套
+#    符号，而该补丁在 KernelSU-Next（dev / v3.4.0~v3.4.2）上都存在失败 hunk 且会与
+#    KSU-Next 自带的 susfs 代码重复定义，无法直接套用。
+# ==============================================================================
+
+name: Build GKI 5.15 KernelSU-Next + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KernelSU-Next 的 tag / 分支 / commit（留空=取最新 tag；建议填 tag 保证可复现）'
+        required: false
+        default: 'v3.4.2'
+      susfs_mode:
+        description: 'SUSFS 集成方式'
+        required: true
+        default: 'lkm'
+        type: choice
+        options:
+          - lkm      # 编译 KSU-Next 自带 susfs_guard_lkm.ko（推荐）
+          - 'off'    # 只集成 KernelSU-Next
+      build_modules:
+        description: '是否额外构建内核模块 (make modules)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      ccache_max_size:
+        description: 'ccache 容量上限（如 2G / 4G）'
+        required: false
+        default: '2G'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-gki-ksunext-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCH: arm64
+  KSU_REF: ${{ inputs.ksu_ref }}
+  SUSFS_MODE: ${{ inputs.susfs_mode }}
+  BUILD_MODULES: ${{ inputs.build_modules }}
+  # ---- ccache ----
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: ${{ inputs.ccache_max_size }}
+  CCACHE_COMPRESS: 'true'
+  CCACHE_COMPRESSLEVEL: '6'
+  # 编译器按内容校验（AOSP 预编译 clang 的 mtime 每次下载都变，用 mtime 会全部 miss）
+  CCACHE_COMPILERCHECK: 'content'
+  # 把绝对路径重写掉，否则每个 job 的 workspace 路径都会让缓存失效
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_NOHASHDIR: 'true'
+  CCACHE_SLOPPINESS: 'pch_defines,time_macros,include_file_mtime,include_file_ctime,file_stat_matches,clang_index_store,gcno_cwd'
+  CCACHE_WRAPPER_DIR: ${{ github.workspace }}/ccache-bin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+          fetch-depth: 1
+          # 不拉子模块：.gitmodules 里那个 KernelSU 是原版 KernelSU，本流程用 KSU-Next
+          submodules: false
+
+      - name: Free Disk Space
+        run: |
+          echo "释放磁盘空间..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Setup Swap
+        run: |
+          echo "设置 8G swap（LTO 链接阶段容易吃内存）..."
+          sudo swapoff /swapfile || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo swapon --show
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip curl wget python3 bc rsync cpio \
+            ccache kmod file gzip xz-utils bison flex libssl-dev libelf-dev \
+            libncurses-dev build-essential
+
+      # ------------------------------------------------------------------
+      # Clang 工具链：AOSP Clang 14.0.6 / r450784e（android13-5.15 的原生工具链）
+      # ------------------------------------------------------------------
+      - name: Setup AOSP Clang Toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p clang
+          PRIMARY_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
+          MIRROR_URL="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20260619-release/Clang-14.0.6-20260619.tar.gz"
+
+          echo "[+] 下载 Clang 工具链..."
+          rm -f clang.tar.gz
+          if ! wget -q --show-progress --timeout=30 --tries=3 "$PRIMARY_URL" -O clang.tar.gz || [ ! -s clang.tar.gz ]; then
+            echo "[!] 主源失败，改用镜像..."
+            wget -q --show-progress --timeout=30 --tries=3 "$MIRROR_URL" -O clang.tar.gz
+          fi
+          [ -s clang.tar.gz ] || { echo "::error::clang 压缩包下载失败"; exit 1; }
+
+          tar -xzf clang.tar.gz -C clang/
+          rm -f clang.tar.gz
+
+          # AOSP archive 是平铺结构(clang/bin/clang)，ZyC 镜像可能多套一层目录，两种都认
+          CLANG_BIN_DIR=""
+          for cand in "$PWD/clang/bin" "$PWD/clang"/*/bin; do
+            if [ -x "$cand/clang" ]; then CLANG_BIN_DIR="$cand"; break; fi
+          done
+          [ -n "$CLANG_BIN_DIR" ] || { echo "::error::找不到 clang 可执行文件"; find "$PWD/clang" -maxdepth 3 -type d | head -20; exit 1; }
+          "$CLANG_BIN_DIR/clang" --version | grep -q clang || { echo "::error::clang 无法运行"; exit 1; }
+
+          echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
+          echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
+          "$CLANG_BIN_DIR/clang" --version
+          "$CLANG_BIN_DIR/ld.lld" --version | head -n2
+
+      # ------------------------------------------------------------------
+      # ccache：用符号链接包装 clang/gcc，kbuild 的每个编译单元都会过缓存
+      # ------------------------------------------------------------------
+      - name: Configure ccache
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR" "$CCACHE_WRAPPER_DIR"
+          CCACHE_BIN="$(command -v ccache)"
+          # ccache 支持“以编译器名被调用”的代理模式：PATH 里排第一位即可命中
+          for tool in clang clang++ gcc g++; do
+            ln -sf "$CCACHE_BIN" "$CCACHE_WRAPPER_DIR/$tool"
+          done
+          ccache --version | head -n1
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -s
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # 主 key 带上 commit：同 commit 重跑能精确命中
+          key: ${{ runner.os }}-ccache-gki515-ksunext-${{ inputs.ksu_ref }}-${{ hashFiles('kernel/arch/arm64/configs/gki_defconfig') }}-${{ github.sha }}
+          # 兜底：总是尽量恢复最近一次的缓存（ccache 自身会忽略不匹配的对象）
+          restore-keys: |
+            ${{ runner.os }}-ccache-gki515-ksunext-${{ inputs.ksu_ref }}-
+            ${{ runner.os }}-ccache-gki515-ksunext-
+            ${{ runner.os }}-ccache-gki515-
+
+      # ------------------------------------------------------------------
+      # 集成 KernelSU-Next（源文件复制 + Makefile/Kconfig 注入由官方脚本完成）
+      # ------------------------------------------------------------------
+      - name: Integrate KernelSU-Next
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          SETUP_REF="${KSU_REF:-dev}"
+          echo "[+] 取 KernelSU-Next 的 setup.sh (ref=$SETUP_REF)"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${SETUP_REF}/kernel/setup.sh" -o "$RUNNER_TEMP/ksu-setup.sh"
+          head -n 5 "$RUNNER_TEMP/ksu-setup.sh"
+
+          echo "[+] 执行 setup.sh ${KSU_REF:-<最新 tag>}"
+          bash "$RUNNER_TEMP/ksu-setup.sh" ${KSU_REF:-}
+
+          echo "[+] 校验集成结果"
+          test -L drivers/kernelsu || { echo "::error::drivers/kernelsu 符号链接缺失"; exit 1; }
+          test -f drivers/kernelsu/Kconfig || { echo "::error::drivers/kernelsu/Kconfig 缺失"; exit 1; }
+          grep -q "kernelsu" drivers/Makefile || { echo "::error::drivers/Makefile 未注入"; exit 1; }
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || { echo "::error::drivers/Kconfig 未注入"; exit 1; }
+          ls -l drivers/kernelsu | head -3
+
+          echo "[+] KernelSU-Next 版本信息"
+          git -C KernelSU-Next log -1 --format='commit: %H%ndate:   %ad%nsubject:%s' --date=iso
+          git -C KernelSU-Next describe --tags --always || true
+          {
+            echo "KSU_SOURCE=KernelSU-Next"
+            echo "KSU_REF=${KSU_REF:-latest-tag}"
+            echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)"
+            echo "KSU_DESCRIBE=$(git -C KernelSU-Next describe --tags --always 2>/dev/null || echo unknown)"
+            echo "KSU_SUBJECT=$(git -C KernelSU-Next log -1 --format=%s)"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 工具链适配补丁（实测必需）：
+      #   AOSP clang-r450784e 的 lib64/clang/14.0.7/lib/ 里只有 baremetal/linux，
+      #   **没有 MLGO 的 regalloc 模型文件**；而 ACK 的 Makefile 里硬编码了
+      #   KBUILD_CFLAGS/LDFLAGS += -mllvm -regalloc-enable-advisor=release。
+      #   于是从 -O1 起（本 defconfig 是 -O3）每个编译单元都会直接报
+      #     error: Requested regalloc eviction advisor analysis could be created. Using default
+      #     1 error generated.
+      #   注意 -O0 不触发，所以这个坑只有在真编译时才暴露。
+      #   改成 =default 就是「加载不到模型时的回退行为」，数值上等价。
+      # ------------------------------------------------------------------
+      - name: Patch Kernel Makefile (MLGO regalloc advisor)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -n '790,800p' Makefile
+          sed -i 's/-mllvm -regalloc-enable-advisor=release/-mllvm -regalloc-enable-advisor=default/g' Makefile
+          echo "--- 补丁后 ---"
+          grep -n "regalloc-enable-advisor" Makefile || { echo "::error::Makefile 里没有 regalloc 参数，上游结构可能变了"; exit 1; }
+          if grep -q 'regalloc-enable-advisor=release' Makefile; then
+            echo "::error::MLGO 补丁未生效"; exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 配置：打开 CONFIG_KSU；关掉 WERROR，避免 clang 14 把新 LTS 代码的告警当错误
+      # ------------------------------------------------------------------
+      - name: Prepare Defconfig
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          DEFCONFIG=arch/arm64/configs/gki_defconfig
+          cp "$DEFCONFIG" "$DEFCONFIG.orig"
+          grep -q '^CONFIG_KSU=y' "$DEFCONFIG" || echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
+          grep -q '^CONFIG_WERROR=n' "$DEFCONFIG" || echo 'CONFIG_WERROR=n' >> "$DEFCONFIG"
+
+          export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          echo "[+] 关键配置项："
+          grep -E '^CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS_ALL|EXT4_FS|MODULES|MODVERSIONS|MODULE_SIG|LTO_CLANG_THIN|CFI_CLANG|WERROR)=' out/.config || true
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU 未生效（先看 KPROBES / EXT4_FS 是否满足依赖）"; exit 1; }
+          grep -q '^CONFIG_KPROBES=y' out/.config || { echo "::error::CONFIG_KPROBES 未开启，KernelSU 无法编译"; exit 1; }
+
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
+          echo "编译内核（$(clang --version | head -n1)）"
+          ccache -z
+          START=$(date -u +%s)
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image Image.gz 2>&1 | tee out/build.log
+          # 注意：只编 Image 不会生成 Module.symvers / scripts/module.lds，
+          # 而外部模块（SUSFS LKM）必须有它们才能编。所以要 lkm 或要模块时都得走一遍 make modules。
+          if [ "$SUSFS_MODE" = "lkm" ] || [ "$BUILD_MODULES" = "true" ]; then
+            echo "[+] 构建模块（生成 Module.symvers / module.lds）..."
+            make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 modules 2>&1 | tee -a out/build.log
+            ls -la out/Module.symvers out/scripts/module.lds
+          fi
+          echo "编译耗时: $(( ($(date -u +%s) - START) / 60 )) 分钟"
+          echo "[+] ccache 命中情况："
+          ccache -s | head -20
+
+      - name: Verify Kernel Image
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          test -f out/arch/arm64/boot/Image || { echo "::error::没生成 Image"; exit 1; }
+          ls -lh out/arch/arm64/boot/Image*
+          # 先把 strings 落盘再 grep：避免 `strings | grep -m1` 里 strings 收 SIGPIPE
+          # 被 pipefail 判成失败（这个坑实测踩过）
+          strings out/arch/arm64/boot/Image > "$RUNNER_TEMP/image.strings"
+          echo "[+] 版本串："
+          grep -m1 '^Linux version' "$RUNNER_TEMP/image.strings" || true
+          echo "[+] kernel.release: $(cat out/include/config/kernel.release)"
+          echo "[+] Image 里的 KernelSU 痕迹："
+          grep -m5 -i 'KernelSU' "$RUNNER_TEMP/image.strings" || echo "::warning::Image 里没搜到 KernelSU 字符串（可能被 LTO 优化掉，以 config 为准）"
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU 不是 y"; exit 1; }
+          {
+            echo "KERNEL_RELEASE=$(cat out/include/config/kernel.release)"
+            echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "LINUX_VERSION_STR=$(grep -m1 '^Linux version' "$RUNNER_TEMP/image.strings" || true)"
+            echo "IMAGE_SIZE=$(stat -c%s out/arch/arm64/boot/Image)"
+            echo "IMAGE_SHA256=$(sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # SUSFS：用刚构建好的内核现场编译 KSU-Next 的 susfs_guard_lkm.ko
+      #
+      # 关于 KBUILD_MODPOST_WARN=1：
+      #   该模块有 6 个符号内核并没有导出（task_work_add / init_mm / __set_fixmap /
+      #   copy_to_kernel_nofault / dcache_clean_inval_poc / saved_boot_config），
+      #   modpost 默认会当成 ERROR 直接掐掉链接。这是上游的设计：
+      #   这些符号由模块自带的 symbol_resolver / patch_memory 在**加载时**用
+      #   kallsyms 现解析，所以必须放行。上游 CI 也是这个路子（make -k + 宽松 modpost）。
+      #   其余 ~91 个未定义符号由内核正常导出，链接期解析、带 CRC，不受影响。
+      #   装机后要用 ksud 自带的加载器（会做符号重定位）：
+      #     adb push susfs_guard_lkm.ko /data/local/tmp/
+      #     su -c "ksud insmod /data/local/tmp/susfs_guard_lkm.ko"
+      #   （ksud 自带的 `ksud susfs load` 只加载内嵌的那个按 KMI 编译的版本，
+      #     它的 vermagic 是官方 release 串，装不进自编内核，所以用 insmod 这条路）
+      # ------------------------------------------------------------------
+      - name: Build SUSFS Guard LKM
+        if: env.SUSFS_MODE == 'lkm'
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$CCACHE_WRAPPER_DIR:$CLANG_BIN_DIR:$PATH"
+          SUSFS_DIR="$PWD/KernelSU-Next/kernel/susfs"
+          test -d "$SUSFS_DIR" || { echo "::error::KernelSU-Next 里没有 kernel/susfs（该 ref 太旧？）。可选：susfs_mode=off 或换 tag"; exit 1; }
+          # 外部模块需要 Module.symvers / scripts/module.lds（由 Build Kernel 里的 make modules 生成）
+          test -f out/Module.symvers || { echo "::error::缺 out/Module.symvers，外部模块编不了（需要先 make modules）"; exit 1; }
+          test -f out/scripts/module.lds || { echo "::error::缺 out/scripts/module.lds"; exit 1; }
+
+          make -k -C out M="$SUSFS_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 KBUILD_MODPOST_WARN=1 modules
+          test -f "$SUSFS_DIR/susfs_guard_lkm.ko" || { echo "::error::susfs_guard_lkm.ko 未生成"; exit 1; }
+
+          cp "$SUSFS_DIR/susfs_guard_lkm.ko" out/susfs_guard_lkm.ko
+          # 和上游 CI 一致：去掉调试段（3.2M -> ~550K），保留符号表（加载器要读）
+          "$CLANG_BIN_DIR/llvm-strip" -d out/susfs_guard_lkm.ko
+          ls -lh out/susfs_guard_lkm.ko
+
+          echo "[+] 模块信息："
+          modinfo out/susfs_guard_lkm.ko | grep -E '^(filename|name|version|vermagic|license|depends)' || true
+          KO_VERMAGIC="$(modinfo -F vermagic out/susfs_guard_lkm.ko | awk '{print $1}')"
+          KREL="$(cat out/include/config/kernel.release)"
+          echo "ko vermagic = $KO_VERMAGIC ; kernel release = $KREL"
+          if [ "$KO_VERMAGIC" != "$KREL" ]; then
+            echo "::error::vermagic 与内核 release 不一致，装机后加载会失败"; exit 1
+          fi
+
+          # 统计未定义符号：内核导出的应占绝大多数，剩几个交给运行时 kallsyms
+          llvm-nm -u out/susfs_guard_lkm.ko | awk '{print $NF}' | sort -u > /tmp/undef.txt
+          awk '{print $2}' out/Module.symvers | sort -u > /tmp/exported.txt
+          UNDEF=$(wc -l < /tmp/undef.txt)
+          RESOLVED=$(comm -12 /tmp/undef.txt /tmp/exported.txt | wc -l)
+          RUNTIME=$(comm -23 /tmp/undef.txt /tmp/exported.txt | wc -l)
+          echo "未定义符号 $UNDEF 个：内核导出(链接期) $RESOLVED 个，运行时 kallsyms 解析 $RUNTIME 个"
+          comm -23 /tmp/undef.txt /tmp/exported.txt | sed 's/^/    runtime: /' || true
+          {
+            echo "SUSFS_KO_SHA256=$(sha256sum out/susfs_guard_lkm.ko | cut -d' ' -f1)"
+            echo "SUSFS_UNDEF_SYMS=$UNDEF"
+            echo "SUSFS_UNDEF_RESOLVED=$RESOLVED"
+            echo "SUSFS_UNDEF_RUNTIME=$RUNTIME"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 打包 AnyKernel3（复用仓库自带模板）
+      # ------------------------------------------------------------------
+      - name: Package AnyKernel3
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if [ ! -d anykernel_template ]; then
+            echo "::warning::没有 anykernel_template，跳过打包"
+            exit 0
+          fi
+          AK3_DIR="$RUNNER_TEMP/ak3"
+          rm -rf "$AK3_DIR"
+          cp -r anykernel_template "$AK3_DIR"
+          cp out/arch/arm64/boot/Image "$AK3_DIR/Image"
+
+          if [ "$SUSFS_MODE" = "lkm" ]; then
+            LABEL="GKI 5.15 + KernelSU-Next ${KSU_DESCRIBE:-} + SUSFS(LKM)"
+          else
+            LABEL="GKI 5.15 + KernelSU-Next ${KSU_DESCRIBE:-}"
+          fi
+          sed -i "s|^kernel.string=.*|kernel.string=$LABEL|" "$AK3_DIR/anykernel.sh" || true
+          sed -i "s|^build.date=.*|build.date=$(date -u +%Y-%m-%d)|" "$AK3_DIR/anykernel.sh" || true
+          grep -E '^(kernel\.string|device\.name1|build\.date)=' "$AK3_DIR/anykernel.sh" || true
+
+          ( cd "$AK3_DIR" && zip -r -q "$GITHUB_WORKSPACE/kernel/out/anykernel.zip" . )
+          ls -lh out/anykernel.zip
+
+      - name: Write Build Info
+        working-directory: kernel
+        run: |
+          {
+            echo "==============================================="
+            echo " GKI 5.15 build info"
+            echo "==============================================="
+            echo "repo commit    : $GITHUB_SHA"
+            echo "workflow run   : $GITHUB_RUN_ID"
+            echo "KernelSU-Next  : ${KSU_COMMIT:-} (${KSU_DESCRIBE:-}) ref=${KSU_REF:-latest-tag}"
+            echo "SUSFS mode     : ${SUSFS_MODE:-}"
+            echo "SUSFS ko sha256: ${SUSFS_KO_SHA256:-n/a}"
+            echo "kernel release : ${KERNEL_RELEASE:-}"
+            echo "linux version  : ${LINUX_VERSION_STR:-}"
+            echo "Image sha256   : ${IMAGE_SHA256:-}"
+            echo "build time     : ${BUILD_TIME:-}"
+            echo "toolchain      : $( "$CLANG_BIN_DIR/clang" --version | head -n1 )"
+            echo "==============================================="
+          } | tee out/build-info.txt
+          cp out/.config out/kernel-config.txt
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GKI-5.15-KSUNext-${{ env.KSU_DESCRIBE || inputs.ksu_ref }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/susfs_guard_lkm.ko
+            kernel/out/anykernel.zip
+            kernel/out/build-info.txt
+            kernel/out/kernel-config.txt
+          retention-days: 30
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            kernel/out/build.log
+            kernel/out/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: ccache Statistics
+        if: always()
+        run: |
+          echo "=== ccache 统计 ==="
+          ccache -s || true
+          echo "=== 缓存目录 ==="
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+
+# ==============================================================================
+#  SUSFS 路线说明（实测结论，2026-10）
+# ------------------------------------------------------------------------------
+#  1) KernelSU-Next 已经把 SUSFS 做成了独立模块（kernel/susfs → susfs_guard_lkm.ko）：
+#     上游 CI 用 DDK 头文件按 KMI 编译，产物内嵌进 ksud，装机后
+#     `ksud susfs load`（或 ksud susfs autoload enable）加载。
+#     => 内核源码不需要打任何 SUSFS 补丁，只需要 CONFIG_KSU=y + 可加载模块。
+#     本工作流更进一步：直接用本次编译出的内核来编译这个 .ko，vermagic/CRC 完全一致。
+#
+#  2) simonpunk/susfs4ksu 的 gki-android13-5.15-dev 是「内核内」路线，需要成对打补丁：
+#       - kernel_patches/50_add_susfs_in_gki-android13-5.15.patch   （内核侧）
+#       - kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch     （KernelSU 侧）
+#     内核侧补丁引用了 ksu_handle_stat / ksu_vfsmnt / ksu_sid / ksu_domain /
+#     ksu_is_input_hook_enabled … 一整套符号，这些符号由 KernelSU 侧补丁提供。
+#     实测（patch -p1 --dry-run）该 KernelSU 侧补丁：
+#       KernelSU-Next dev      : 有失败 hunk（supercall/dispatch.c、supercall.c 等）
+#       KernelSU-Next v3.4.2   : 有失败 hunk
+#       KernelSU-Next v3.4.1/0 : 失败更多
+#       KernelSU-Next v3.3.0/2.0: 大面积失败
+#       tiann/KernelSU (master): 也有失败 hunk
+#     且 KSU-Next 自身已定义同名 susfs 胶水函数，套补丁会重复定义。
+#     => 想用「内核内」SUSFS，正确搭配是原版 KernelSU(tiann) + 配套 tag，而不是 KSU-Next。
+#        本仓库既有的 build_gki.yml / build_gki_ksu.yml（走原版 KernelSU）才适合那条路线。
+# ==============================================================================
